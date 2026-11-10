@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -46,6 +47,11 @@ type Server struct {
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into keyDir/jwt.key
+
+	// tokenEpochVal is the current JWT epoch (authEpochKey), cached from the DB at
+	// startup and advanced by a password change. verifyJWT rejects any token signed
+	// below it, so bumping it revokes every session opened under the old password.
+	tokenEpochVal atomic.Int64
 
 	scrubSecrets bool // drop ARTEX_PG_DSN and the API keys from the environment once read (binary only)
 
@@ -163,6 +169,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		loginLimit: newLoginLimiter(time.Now)}
 	for _, o := range opts {
 		o(s)
+	}
+	if m != nil {
+		s.loadTokenEpoch(m.pg)
 	}
 	s.initSetupToken()
 	s.initSideQuestions()
@@ -977,7 +986,7 @@ func (s *Server) Handler() http.Handler {
 // with a valid token gets the service name and version; the web UI's top bar
 // reads the version, and sends its token.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWT(extractToken(r), s.jwtKey, s.tokenEpoch()) {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
@@ -1576,12 +1585,12 @@ type createTaskReq struct {
 	CategoryID           *int64   `json:"category_id,omitempty"`
 	Description          string   `json:"description"`
 	Goal                 string   `json:"goal"`
-	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`    // the LLM profile to run this task on; omitted/null = use the active profile
-	LLMProfileIDs        []int64  `json:"llm_profile_ids,omitempty"`   // ordered task-level profile chain; the first entry takes effect initially
-	SourceTaskIDs        []string `json:"source_task_ids,omitempty"`   // direct, read-only inherited source tasks
-	CompanyIDs           []int64  `json:"company_ids,omitempty"`       // links the company scope and snapshots its current assets; does not copy assets or force intent generation
+	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`  // the LLM profile to run this task on; omitted/null = use the active profile
+	LLMProfileIDs        []int64  `json:"llm_profile_ids,omitempty"` // ordered task-level profile chain; the first entry takes effect initially
+	SourceTaskIDs        []string `json:"source_task_ids,omitempty"` // direct, read-only inherited source tasks
+	CompanyIDs           []int64  `json:"company_ids,omitempty"`     // links the company scope and snapshots its current assets; does not copy assets or force intent generation
 	TimeoutSeconds       int      `json:"timeout_seconds"`
-	LLMRotate            *bool    `json:"llm_rotate"`             // task-level timeout (seconds); 0/omitted = no limit
+	LLMRotate            *bool    `json:"llm_rotate"`                  // task-level timeout (seconds); 0/omitted = no limit
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner heartbeat interval (seconds); 0/omitted = default 600 (10min); floor = default = 600, lower values are raised to 600
 	PlanQuietMode        *bool    `json:"plan_quiet_mode,omitempty"`   // planner quiet-mode switch (#86); omitted = default on; false = edge rounds always plan
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // issue one seed intent at creation (content = description + goal) so a worker can start right away without waiting for the first planner round; omitted/null = default off, the standard plan-then-execute flow. Pass true explicitly to enable (for CTF tasks often solved in one work, this skips the pre-start planner round).

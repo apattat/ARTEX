@@ -72,6 +72,46 @@ Sync asset data directly from [ScopeSentry](https://github.com/Autumn-27/ScopeSe
 
 ---
 
+## Security model
+
+ARTEX drives an LLM agent that runs real shell commands and network tools against
+targets. Read this before pointing it at anything. Understand what the built-in
+controls do and — just as important — what they do **not** do.
+
+**What protects the host and keeps the agent in bounds**
+
+- **Destructive-command intercept rules** (`rm -rf`, `mkfs`, `dd of=/dev/…`, fork
+  bombs, `shutdown`, etc.) are seeded as ordinary, user-editable DB rules and
+  evaluated on every tool call.
+- **Authorization scope** is registered per task (`add_task_scope`) and enforced by
+  the worker/planner prompts plus an operator-editable **asset blocklist**
+  (exact/fuzzy domain·ip·url + CIDR).
+- **Operational hardening:** loopback-only bind by default, a one-time setup token
+  for the first-run claim, per-IP login rate limiting with trusted-proxy support,
+  bcrypt password hashing, API keys and the DB DSN scrubbed from the environment
+  before any child process (agent shell, custom tool, MCP server) is spawned, and
+  the JWT signing key isolated in its own volume. Changing the admin password now
+  revokes every previously issued token immediately.
+
+**What these controls are not**
+
+- The destructive-command rules are a **regex denylist**. They stop honest mistakes
+  and the obvious cases, but a capable or adversarial agent can bypass string
+  matching (alternate paths like `/bin/rm`, `find … -delete`, quoting, shell
+  expansion, encoded payloads). Treat them as a seatbelt, **not** a sandbox.
+- Scope enforcement is **prompt-level plus a blocklist**, not a network boundary.
+  The agent is *instructed* to stay in scope and *blocked* from listed assets; it is
+  not physically prevented from reaching an address you forgot to list.
+- There is a single `ARTEX` admin account; anyone who can reach the UI with the
+  password has full control.
+
+**Recommendation:** run ARTEX on an isolated host whose **network egress is
+restricted to your authorized targets** (container network policy, firewall, or an
+allowlisting proxy), keep it bound to loopback or behind an authenticated reverse
+proxy, and only ever point it at systems you are explicitly authorized to test. The
+platform controls are defense-in-depth on top of that boundary, not a substitute for
+it.
+
 ## Installation
 
 > Requires a **PostgreSQL** database; exploration requires an **LLM** (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, which can also be configured in the UI).

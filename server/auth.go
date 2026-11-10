@@ -19,13 +19,20 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/Autumn-27/artex/config"
+	"github.com/Autumn-27/artex/db"
 )
 
 const (
 	jwtKeyFilename = "jwt.key"
 	authPassKey    = "auth.password_hash"
-	jwtTTL         = 7 * 24 * time.Hour
-	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	// authEpochKey is the monotonic "token epoch". Every issued JWT carries the
+	// epoch value current at signing time; requireAuth rejects a token whose epoch
+	// is below the stored one. Changing the password (or running reset-password.sh)
+	// bumps it, so every session opened under the old password stops verifying at
+	// once — the signing key no longer has to be rotated to revoke sessions.
+	authEpochKey = "auth.token_epoch"
+	jwtTTL       = 7 * 24 * time.Hour
+	keyChars     = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	// The lower bound matches the setup page's frontend validation — validation that
 	// lives only in the frontend is as good as none: hitting the API directly bypasses
@@ -158,24 +165,42 @@ func samePath(a, b string) bool {
 	return a == b
 }
 
-// signJWT issues a 7-day HS256 token for user ARTEX.
-func signJWT(key []byte) (string, error) {
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "ARTEX",
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
+// artexClaims is the token payload: the standard registered claims plus the
+// epoch the token was signed under (see authEpochKey).
+type artexClaims struct {
+	Epoch int64 `json:"epoch"`
+	jwt.RegisteredClaims
+}
+
+// signJWTEpoch issues a 7-day HS256 token for user ARTEX stamped with epoch.
+func signJWTEpoch(key []byte, epoch int64) (string, error) {
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, artexClaims{
+		Epoch: epoch,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "ARTEX",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
 	}).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+// signJWT issues a token at epoch 0. Retained for tests and callers that have no
+// Server (and therefore no live epoch); production paths use signJWTEpoch with
+// s.tokenEpoch() so the token tracks the current epoch.
+func signJWT(key []byte) (string, error) { return signJWTEpoch(key, 0) }
+
+// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token whose
+// epoch is at least wantEpoch. A token signed before the epoch was bumped (e.g. by
+// a password change) has epoch < wantEpoch and is rejected.
+func verifyJWT(tokenStr string, key []byte, wantEpoch int64) bool {
+	var claims artexClaims
+	t, err := jwt.ParseWithClaims(tokenStr, &claims, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return key, nil
 	})
-	return err == nil && t.Valid
+	return err == nil && t.Valid && claims.Epoch >= wantEpoch
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
@@ -204,7 +229,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "Unauthorized")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		if !verifyJWT(tok, s.jwtKey, s.tokenEpoch()) {
 			writeErr(w, 401, "token is invalid or expired")
 			return
 		}
@@ -308,7 +333,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	s.setupMu.Lock()
 	s.setupToken = ""
 	s.setupMu.Unlock()
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signJWTEpoch(s.jwtKey, s.tokenEpoch())
 	if err != nil {
 		writeErr(w, 500, "token generation failed")
 		return
@@ -324,7 +349,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWT(extractToken(r), s.jwtKey, s.tokenEpoch()) {
 		writeErr(w, 401, "Unauthorized")
 		return
 	}
@@ -366,7 +391,48 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "Save failed: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	// Revoke every session opened under the old password by bumping the token
+	// epoch. Persist first, then advance the in-memory value, so the two never
+	// disagree: if the write fails we keep the old epoch (old tokens stay valid,
+	// consistent with the DB) and the admin can retry. A successful bump makes the
+	// caller's own current token stale too, so we hand back a fresh one below.
+	if _, err := s.bumpTokenEpoch(pg); err != nil {
+		log.Printf("[auth] password changed but token-epoch bump failed to persist: %v (old sessions remain valid until the next change)", err)
+	}
+	tok, err := signJWTEpoch(s.jwtKey, s.tokenEpoch())
+	if err != nil {
+		// The password is already changed; the client just needs to log in again.
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "token": tok})
+}
+
+// tokenEpoch returns the current token epoch (0 until the first bump).
+func (s *Server) tokenEpoch() int64 { return s.tokenEpochVal.Load() }
+
+// bumpTokenEpoch persists epoch+1 and, only on success, advances the in-memory
+// value. It returns the new epoch.
+func (s *Server) bumpTokenEpoch(pg *db.DB) (int64, error) {
+	next := s.tokenEpochVal.Load() + 1
+	if err := pg.SetSetting(authEpochKey, strconv.FormatInt(next, 10)); err != nil {
+		return 0, err
+	}
+	s.tokenEpochVal.Store(next)
+	return next, nil
+}
+
+// loadTokenEpoch reads the persisted epoch into memory at startup. A missing key
+// or unparseable value leaves the epoch at 0.
+func (s *Server) loadTokenEpoch(pg *db.DB) {
+	if pg == nil {
+		return
+	}
+	if v, ok, err := pg.GetSetting(authEpochKey); err == nil && ok {
+		if n, perr := strconv.ParseInt(strings.TrimSpace(v), 10, 64); perr == nil {
+			s.tokenEpochVal.Store(n)
+		}
+	}
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
@@ -416,7 +482,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(s
 		return
 	}
 	s.loginLimit.reset(ip)
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signJWTEpoch(s.jwtKey, s.tokenEpoch())
 	if err != nil {
 		writeErr(w, 500, "token generation failed")
 		return
