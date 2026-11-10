@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -46,6 +47,11 @@ type Server struct {
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into keyDir/jwt.key
+
+	// tokenEpochVal is the current JWT epoch (authEpochKey), cached from the DB at
+	// startup and advanced by a password change. verifyJWT rejects any token signed
+	// below it, so bumping it revokes every session opened under the old password.
+	tokenEpochVal atomic.Int64
 
 	scrubSecrets bool // drop ARTEX_PG_DSN and the API keys from the environment once read (binary only)
 
@@ -163,6 +169,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		loginLimit: newLoginLimiter(time.Now)}
 	for _, o := range opts {
 		o(s)
+	}
+	if m != nil {
+		s.loadTokenEpoch(m.pg)
 	}
 	s.initSetupToken()
 	s.initSideQuestions()
@@ -977,7 +986,7 @@ func (s *Server) Handler() http.Handler {
 // with a valid token gets the service name and version; the web UI's top bar
 // reads the version, and sends its token.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWT(extractToken(r), s.jwtKey, s.tokenEpoch()) {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}

@@ -147,6 +147,11 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 INSERT INTO settings(key, value)
 VALUES ('$PASS_KEY', crypt(:'newpw', gen_salt('bf', $BCRYPT_COST)))
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
+-- Bump the token epoch so JWTs issued under the old password stop verifying.
+-- A running server caches the epoch in memory, so this takes effect on its next
+-- restart; restart the server after a reset to force every old session out now.
+INSERT INTO settings(key, value) VALUES ('auth.token_epoch', '1')
+ON CONFLICT (key) DO UPDATE SET value = (COALESCE(settings.value, '0')::bigint + 1)::text, updated_at = now();
 SQL
 )
 
