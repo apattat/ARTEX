@@ -29,6 +29,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: gofmt
+        # Formatting gate: fail if any non-generated Go file is not gofmt-clean.
+        # Uses the gofmt from the toolchain pinned in go.mod (setup-go above).
+        run: |
+          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './web/*'))
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean; run: gofmt -w <file>"
+            echo "$unformatted"
+            exit 1
+          fi
       - run: go build ./...
       - run: go vet ./...
       # Skipped tests, tracked in issue #9:
